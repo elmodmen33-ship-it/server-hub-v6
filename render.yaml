@@ -6,9 +6,9 @@ services:
     plan: free
     healthCheckPath: /api/healthz
     buildCommand: |
-      cd backend && npm install
+      cd backend && npm install && npm run build
       cd ../frontend && npm install && npx vite build
-    startCommand: cd backend && npx tsx src/index.ts
+    startCommand: cd backend && node --enable-source-maps dist/index.mjs
     envVars:
       - key: PORT
         value: 3001

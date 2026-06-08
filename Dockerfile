@@ -24,7 +24,8 @@ RUN cd frontend && npm install --force
 COPY . .
 
 RUN cd frontend && ./node_modules/.bin/vite build
+RUN cd backend && npm run build
 
 EXPOSE 3001
 
-CMD ["sh", "-c", "cd backend && npx tsx src/index.ts"]
+CMD ["node", "--enable-source-maps", "backend/dist/index.mjs"]
