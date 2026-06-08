@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY backend/package.json backend/package-lock.json* ./backend/
-RUN cd backend && npm install
+RUN cd backend && npm install --include=dev
 
 COPY frontend/package.json frontend/package-lock.json* ./frontend/
 RUN cd frontend && npm install --force

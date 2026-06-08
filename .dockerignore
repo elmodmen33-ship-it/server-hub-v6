@@ -1,0 +1,10 @@
+node_modules/
+dist/
+frontend/dist/
+*.log
+.env
+.env.local
+.git/
+.cache/
+.turbo/
+*.tgz
