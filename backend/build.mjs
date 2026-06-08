@@ -1,12 +1,18 @@
-import { rmSync, existsSync } from "fs";
+import { rmSync, existsSync, readdirSync } from "fs";
 import { build } from "esbuild";
+import { join, dirname } from "path";
 import { fileURLToPath } from "url";
-import { dirname, join } from "path";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const distDir = join(__dirname, "dist");
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
-if (existsSync(distDir)) rmSync(distDir, { recursive: true });
+console.log("CWD:", process.cwd());
+console.log("__dirname:", __dirname);
+
+const outDir = join(__dirname, "dist");
+console.log("Output dir:", outDir);
+
+if (existsSync(outDir)) rmSync(outDir, { recursive: true });
 
 await build({
   entryPoints: [join(__dirname, "src/index.ts")],
@@ -14,7 +20,7 @@ await build({
   platform: "node",
   target: "node20",
   format: "esm",
-  outdir: distDir,
+  outdir: outDir,
   sourcemap: true,
   external: [
     "bcryptjs",
@@ -34,3 +40,5 @@ const __dirname = dirname(__filename);
 `.trim(),
   },
 });
+
+console.log("Build output:", readdirSync(outDir));
