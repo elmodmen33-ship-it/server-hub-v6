@@ -65,7 +65,14 @@ terminalRouterAPI.post("/terminal/sessions", authenticate, async (req: Request, 
       clients: new Set(),
     };
 
-    const pty = await import("node-pty");
+    let pty: typeof import("node-pty");
+    try {
+      pty = await import("node-pty");
+    } catch (importErr) {
+      logger.error({ err: importErr }, "node-pty not available");
+      res.status(500).json({ error: "Terminal not available on this platform" });
+      return;
+    }
 
     const workDir = cwd || (isWindows ? process.env.USERPROFILE || "C:\\" : process.env.HOME || "/");
 
@@ -76,8 +83,9 @@ terminalRouterAPI.post("/terminal/sessions", authenticate, async (req: Request, 
       shell = "cmd.exe";
       shellArgs = [];
     } else {
-      shell = process.env.SHELL || "/bin/bash";
-      shellArgs = ["-i"];
+      const candidates = [process.env.SHELL, "/bin/bash", "/bin/sh"];
+      shell = candidates.find(s => { try { return s && fs.existsSync(s); } catch { return false; } }) || "/bin/sh";
+      shellArgs = shell.endsWith("bash") ? ["-i"] : [];
     }
 
     const useWsl = isWindows && detectWslShell() !== null;
@@ -101,23 +109,21 @@ terminalRouterAPI.post("/terminal/sessions", authenticate, async (req: Request, 
 
     if (!isWindows) {
       setTimeout(() => {
-        ptyProcess.write("export LANG=en_US.UTF-8\n");
-        ptyProcess.write("export LC_ALL=en_US.UTF-8\n");
-        ptyProcess.write("export LC_CTYPE=en_US.UTF-8\n");
-        ptyProcess.write("export TERM=xterm-256color\n");
-        ptyProcess.write("stty utf8\n");
-        ptyProcess.write("export PS1=$'\\e[1;32m\\xe2\\x94\\x8c\\xe2\\x94\\x80\\xe2\\x94\\x80(\\e[1;32mrunner\\e[0m\\e[1;32m\\xe2\\x99\\xa5\\e[1;32mserverhub\\e[1;32m)-[\\e[1;34m\\w\\e[1;32m]\\n\\e[1;32m\\xe2\\x94\\x94\\xe2\\x94\\x80\\e[0m '\n");
-        ptyProcess.write("bind 'set completion-ignore-case on'\n");
-        ptyProcess.write("bind 'set show-all-if-ambiguous on'\n");
-        ptyProcess.write("bind 'set colored-stats on'\n");
-        ptyProcess.write("clear\n");
-      }, 500);
+        try {
+          ptyProcess.write("export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 TERM=xterm-256color\n");
+          ptyProcess.write("PS1='\\[\\e[1;32m\\]┌──(\\[\\e[32m\\]runner\\[\\e[0m\\]\\[\\e[1;32m\\]♥\\[\\e[1;32m\\]serverhub\\[\\e[1;32m\\])-\\[\\e[1;34m\\][\\w]\\[\\e[1;32m\\]\\n└──\\[\\e[0m\\$ '\n");
+          ptyProcess.write("stty utf8 2>/dev/null; bind 'set completion-ignore-case on' 2>/dev/null; bind 'set show-all-if-ambiguous on' 2>/dev/null\n");
+          ptyProcess.write("clear\n");
+        } catch {}
+      }, 300);
     } else {
       setTimeout(() => {
-        ptyProcess.write("cls\r\n");
-        ptyProcess.write("\x1b[1;32m\xe2\x94\x8c\xe2\x94\x80\xe2\x94\x80(\x1b[32mrunner\x1b[0m\x1b[1;32m\xe2\x99\xa5\x1b[1;32mserverhub\x1b[1;32m)-[\x1b[1;34m%cd%\x1b[1;32m]\r\n");
-        ptyProcess.write("\x1b[1;32m\xe2\x94\x94\xe2\x94\x80\xe2\x80\xbf\x1b[0m ");
-      }, 500);
+        try {
+          ptyProcess.write("cls\r\n");
+          ptyProcess.write("\x1b[1;32m┌──(\x1b[32mrunner\x1b[0m\x1b[1;32m♥\x1b[1;32mserverhub\x1b[1;32m)-[\x1b[1;34m%cd%\x1b[1;32m]\r\n");
+          ptyProcess.write("\x1b[1;32m└──\x1b[0m ");
+        } catch {}
+      }, 300);
     }
 
     ptyProcess.onData((data: string) => {
