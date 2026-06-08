@@ -1,0 +1,12 @@
+# nixpacks.toml
+[phases.setup]
+nixPkgs = ["python3", "make", "gcc", "gnumake"]
+
+[phases.install]
+cmds = ["cd backend && npm install", "cd frontend && npm install --force"]
+
+[phases.build]
+cmds = ["cd frontend && npx vite build", "cd backend && npm run build"]
+
+[start]
+cmd = "cd backend && node --enable-source-maps dist/index.mjs"
