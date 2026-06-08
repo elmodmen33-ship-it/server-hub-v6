@@ -1,15 +1,20 @@
 import { rmSync, existsSync } from "fs";
 import { build } from "esbuild";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
 
-if (existsSync("dist")) rmSync("dist", { recursive: true });
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const distDir = join(__dirname, "dist");
+
+if (existsSync(distDir)) rmSync(distDir, { recursive: true });
 
 await build({
-  entryPoints: ["src/index.ts"],
+  entryPoints: [join(__dirname, "src/index.ts")],
   bundle: true,
   platform: "node",
   target: "node20",
   format: "esm",
-  outdir: "dist",
+  outdir: distDir,
   sourcemap: true,
   external: [
     "bcryptjs",
