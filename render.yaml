@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: server-hub
+    runtime: node
+    region: oregon
+    plan: free
+    healthCheckPath: /api/healthz
+    buildCommand: |
+      cd backend && npm install
+      cd ../frontend && npm install && npx vite build
+    startCommand: cd backend && npx tsx src/index.ts
+    envVars:
+      - key: PORT
+        value: 3001
+      - key: NODE_ENV
+        value: production
+      - key: LANG
+        value: en_US.UTF-8
+      - key: LC_ALL
+        value: en_US.UTF-8
