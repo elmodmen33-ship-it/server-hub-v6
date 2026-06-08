@@ -1,6 +1,5 @@
 import { rmSync, existsSync } from "fs";
 import { build } from "esbuild";
-import { esbuildPluginPino } from "esbuild-plugin-pino";
 
 if (existsSync("dist")) rmSync("dist", { recursive: true });
 
@@ -19,7 +18,6 @@ await build({
     "ssh2",
     "fsevents",
   ],
-  plugins: [esbuildPluginPino({ transports: ["pino-pretty"] })],
   banner: {
     js: `
 import { createRequire } from 'module';
