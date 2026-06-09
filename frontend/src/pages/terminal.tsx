@@ -7,7 +7,7 @@ import "xterm/css/xterm.css";
 import {
   Plus, X, RotateCcw, Trash2, TerminalSquare,
   Eye, EyeOff, Maximize2, Minimize2,
-  Palette, ChevronDown,
+  Palette, ChevronDown, AlertTriangle,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
@@ -27,6 +27,7 @@ interface TabResources {
   term: XTerm | null;
   fitAddon: FitAddon | null;
   heartbeat: ReturnType<typeof setInterval> | null;
+  destroyed: boolean;
 }
 
 const KALI_THEME = {
@@ -102,20 +103,6 @@ const THEMES: Record<ThemeKey, { label: string; theme: typeof DARK_THEME; previe
   dracula: { label: "Dracula", theme: DRACULA_THEME, preview: "#282a36" },
 };
 
-const STORAGE_KEY = "sh_terminal_tabs";
-
-function loadSavedTabs(): Tab[] {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return JSON.parse(raw);
-  } catch {}
-  return [];
-}
-
-function saveTabs(tabs: Tab[]) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(tabs));
-}
-
 export default function TerminalPage() {
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
@@ -155,6 +142,19 @@ export default function TerminalPage() {
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
+  useEffect(() => {
+    return () => {
+      for (const tabId of Object.keys(resources.current)) {
+        const res = resources.current[tabId];
+        res.destroyed = true;
+        if (res.heartbeat) clearInterval(res.heartbeat);
+        if (res.ws) { res.ws.onclose = null; res.ws.close(); }
+        if (res.term) res.term.dispose();
+      }
+      resources.current = {};
+    };
+  }, []);
+
   const setStatus = (tabId: string, s: ConnStatus) => setStatuses((prev) => ({ ...prev, [tabId]: s }));
 
   const buildWsUrl = (sessionId: string) => {
@@ -163,22 +163,32 @@ export default function TerminalPage() {
   };
 
   const getRes = (tabId: string): TabResources => {
-    if (!resources.current[tabId]) resources.current[tabId] = { ws: null, term: null, fitAddon: null, heartbeat: null };
+    if (!resources.current[tabId]) resources.current[tabId] = { ws: null, term: null, fitAddon: null, heartbeat: null, destroyed: false };
     return resources.current[tabId];
   };
 
   const connectWs = useCallback((tabId: string, sessionId: string) => {
     const res = getRes(tabId);
+    if (res.destroyed) return;
     if (res.ws) { res.ws.onclose = null; res.ws.close(); }
     if (res.heartbeat) clearInterval(res.heartbeat);
 
     setStatus(tabId, "connecting");
-    const ws = new WebSocket(buildWsUrl(sessionId));
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(buildWsUrl(sessionId));
+    } catch {
+      setStatus(tabId, "offline");
+      addLog("Failed to connect");
+      return;
+    }
     res.ws = ws;
+    let serverClosed = false;
 
     ws.onopen = () => {
+      if (res.destroyed) { ws.close(); return; }
       setStatus(tabId, "connected");
-      addLog(`Session connected`);
+      addLog("Terminal connected");
       const { fitAddon } = getRes(tabId);
       if (fitAddon) {
         try {
@@ -193,28 +203,49 @@ export default function TerminalPage() {
     };
 
     ws.onmessage = (evt) => {
+      if (res.destroyed) return;
       try {
         const msg = JSON.parse(evt.data as string);
         const { term } = getRes(tabId);
         if (msg.type === "output" && term) term.write(msg.data);
-        else if (msg.type === "exit") { setStatus(tabId, "offline"); addLog(`Session exited`); }
+        else if (msg.type === "exit") {
+          serverClosed = true;
+          setStatus(tabId, "offline");
+          if (res.heartbeat) { clearInterval(res.heartbeat); res.heartbeat = null; }
+          addLog("Session ended");
+          const { term: t } = getRes(tabId);
+          if (t) t.write("\r\n\x1b[33m[Session ended]\x1b[0m\r\n");
+        }
       } catch {}
     };
 
     ws.onclose = () => {
+      if (res.destroyed) return;
       const r = getRes(tabId);
       if (r.heartbeat) { clearInterval(r.heartbeat); r.heartbeat = null; }
+      if (serverClosed) {
+        setStatus(tabId, "offline");
+        return;
+      }
       setStatus(tabId, "reconnecting");
-      addLog(`Disconnected, reconnecting...`);
-      setTimeout(() => { if (getRes(tabId).ws === ws || getRes(tabId).ws === null) connectWs(tabId, sessionId); }, 3000);
+      addLog("Disconnected, reconnecting...");
+      setTimeout(() => {
+        if (!getRes(tabId).destroyed && (getRes(tabId).ws === ws || getRes(tabId).ws === null)) {
+          connectWs(tabId, sessionId);
+        }
+      }, 3000);
     };
 
-    ws.onerror = () => { setStatus(tabId, "offline"); addLog(`Connection error`); };
+    ws.onerror = () => {
+      if (res.destroyed) return;
+      setStatus(tabId, "offline");
+      addLog("Connection error");
+    };
   }, [addLog]);
 
   const mountTerminal = useCallback((tabId: string, el: HTMLDivElement, sessionId: string) => {
     const res = getRes(tabId);
-    if (res.term) return;
+    if (res.term || res.destroyed) return;
 
     const termThemeObj = THEMES[termTheme].theme;
 
@@ -240,6 +271,8 @@ export default function TerminalPage() {
     term.loadAddon(unicode11Addon);
     term.unicode.activeVersion = "11";
     term.open(el);
+
+    term.write("\x1b[36mConnecting to terminal...\x1b[0m\r\n");
 
     requestAnimationFrame(() => { try { fitAddon.fit(); } catch {} });
     setTimeout(() => { try { fitAddon.fit(); } catch {} }, 100);
@@ -267,27 +300,25 @@ export default function TerminalPage() {
   }, [connectWs, termTheme]);
 
   const createTab = useCallback(async (name?: string) => {
-    const tabName = name || `Terminal`;
+    const tabName = name || "Terminal";
     try {
       const session = await api.createTerminalSession({ name: tabName });
       const tabId = session.id;
       const newTab = { id: tabId, name: tabName, sessionId: session.id };
-      setTabs((prev) => {
-        const updated = [...prev, newTab];
-        saveTabs(updated);
-        return updated;
-      });
+      setTabs((prev) => [...prev, newTab]);
       setActiveTabId(tabId);
       addLog(`Created terminal: ${tabName}`);
       return newTab;
-    } catch {
+    } catch (err) {
       toast({ title: "Failed to create terminal", variant: "destructive" });
+      addLog("Failed to create terminal session");
       return null;
     }
   }, [addLog, toast]);
 
   const closeTab = useCallback((tabId: string) => {
     const res = getRes(tabId);
+    res.destroyed = true;
     if (res.heartbeat) clearInterval(res.heartbeat);
     if (res.ws) { res.ws.onclose = null; res.ws.close(); }
     if (res.term) res.term.dispose();
@@ -297,27 +328,18 @@ export default function TerminalPage() {
     if (tab) api.killTerminalSession(tab.sessionId).catch(() => {});
     setTabs((prev) => {
       const rem = prev.filter((t) => t.id !== tabId);
-      saveTabs(rem);
       setActiveTabId((curr) => curr === tabId ? (rem.length > 0 ? rem[rem.length - 1].id : null) : curr);
       return rem;
     });
     setStatuses((prev) => { const n = { ...prev }; delete n[tabId]; return n; });
-    addLog(`Closed terminal`);
+    addLog("Closed terminal");
   }, [tabs, addLog]);
 
-  // Initialize: load saved tabs or create default
   useEffect(() => {
     if (initialized) return;
     setInitialized(true);
-
-    const saved = loadSavedTabs();
-    if (saved.length > 0) {
-      setTabs(saved);
-      setActiveTabId(saved[0].id);
-      addLog("Restored saved sessions");
-    } else {
-      createTab("Terminal");
-    }
+    localStorage.removeItem("sh_terminal_tabs");
+    createTab("Terminal");
   }, [initialized, createTab, addLog]);
 
   useEffect(() => {
@@ -362,8 +384,17 @@ export default function TerminalPage() {
     if (!activeTabId) return;
     const tab = tabs.find((t) => t.id === activeTabId);
     if (!tab) return;
-    getRes(activeTabId).term?.clear();
-    connectWs(activeTabId, tab.sessionId);
+    const res = getRes(activeTabId);
+    res.destroyed = true;
+    if (res.ws) { res.ws.onclose = null; res.ws.close(); }
+    if (res.heartbeat) clearInterval(res.heartbeat);
+    if (res.term) res.term.dispose();
+    delete resources.current[activeTabId];
+    setStatuses((prev) => ({ ...prev, [activeTabId]: "connecting" }));
+    setTimeout(() => {
+      const el = containerRefs.current[activeTabId];
+      if (el) mountTerminal(activeTabId, el, tab.sessionId);
+    }, 100);
   };
 
   const activeStatus = activeTabId ? statuses[activeTabId] : undefined;
@@ -494,7 +525,7 @@ export default function TerminalPage() {
                 <div className="text-zinc-700 text-center py-4">No logs yet</div>
               ) : (
                 logs.map((log, i) => (
-                  <div key={i} className={`${log.includes("error") || log.includes("Error") ? "text-red-400" : log.includes("connected") || log.includes("created") ? "text-green-400" : log.includes("disconnected") || log.includes("exited") ? "text-yellow-400" : "text-zinc-500"}`}>
+                  <div key={i} className={`${log.includes("error") || log.includes("Error") || log.includes("Failed") ? "text-red-400" : log.includes("connected") || log.includes("Created") ? "text-green-400" : log.includes("Disconnected") || log.includes("ended") ? "text-yellow-400" : "text-zinc-500"}`}>
                     {log}
                   </div>
                 ))
