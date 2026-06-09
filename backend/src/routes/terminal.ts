@@ -4,9 +4,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { IncomingMessage } from "http";
 import { logger } from "../lib/logger";
 import * as os from "os";
-import * as path from "path";
-import { execSync } from "child_process";
-import * as fs from "fs";
+import { spawn as spawnChild, type ChildProcess } from "child_process";
 import { authenticate } from "../middleware/authenticate";
 
 export const terminalRouterAPI: IRouter = Router();
@@ -16,35 +14,26 @@ interface TerminalSession {
   name: string;
   created_at: string;
   status: string;
-  ptyProcess?: any;
+  child?: ChildProcess;
   clients: Set<WebSocket>;
+  usePty: boolean;
+  ptyProcess?: any;
 }
 
 const sessions = new Map<string, TerminalSession>();
+const isWindows = os.platform() === "win32";
 
 function generateId(): string {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
 
-const isWindows = os.platform() === "win32";
-
-function detectWslShell(): string | null {
-  if (!isWindows) return null;
-  try {
-    const output = execSync("wsl -l -q 2>&1", { timeout: 5000, encoding: "utf8" }).trim();
-    const distros = output.split(/\r?\n/).map(l => l.replace(/\0/g, "").trim()).filter(l => l.length > 0 && !l.includes("Copyright") && !l.includes("Usage"));
-    if (distros.length > 0) return "wsl";
-  } catch {}
-  return null;
-}
-
-function getShellInitScript(): string {
-  const initPath = path.join(__dirname, "..", "shell-init.ps1");
-  try {
-    return fs.readFileSync(initPath, "utf8").trim();
-  } catch {
-    return "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8";
+function getShell(): { shell: string; args: string[] } {
+  if (isWindows) return { shell: "cmd.exe", args: [] };
+  const candidates = ["/bin/bash", "/bin/sh", "/usr/bin/bash", "/usr/bin/sh"];
+  for (const s of candidates) {
+    try { const fs = require("fs"); if (fs.existsSync(s)) return { shell: s, args: ["-i"] }; } catch {}
   }
+  return { shell: "/bin/sh", args: [] };
 }
 
 terminalRouterAPI.get("/terminal/sessions", authenticate, async (_req: Request, res: Response): Promise<void> => {
@@ -55,103 +44,100 @@ terminalRouterAPI.get("/terminal/sessions", authenticate, async (_req: Request, 
 });
 
 terminalRouterAPI.post("/terminal/sessions", authenticate, async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { name = "Terminal", cwd } = req.body;
-    const id = generateId();
-    const session: TerminalSession = {
-      id, name: name || "Terminal",
-      created_at: new Date().toISOString(),
-      status: "running",
-      clients: new Set(),
-    };
+  const { name = "Terminal", cwd } = req.body;
+  const id = generateId();
+  const session: TerminalSession = {
+    id, name: name || "Terminal",
+    created_at: new Date().toISOString(),
+    status: "running",
+    clients: new Set(),
+    usePty: false,
+  };
 
-    let pty: typeof import("node-pty");
+  const workDir = cwd || (isWindows ? process.env.USERPROFILE || "C:\\" : process.env.HOME || "/tmp");
+  const { shell, args } = getShell();
+
+  let ptyAvailable = false;
+  let pty: any;
+  try {
+    pty = await import("node-pty");
+    ptyAvailable = true;
+  } catch {
+    ptyAvailable = false;
+  }
+
+  if (ptyAvailable && pty) {
     try {
-      pty = await import("node-pty");
-    } catch (importErr) {
-      logger.error({ err: importErr }, "node-pty not available");
-      res.status(500).json({ error: "Terminal not available on this platform" });
+      const ptyProcess = pty.spawn(shell, args, {
+        name: "xterm-256color",
+        cols: 120,
+        rows: 30,
+        cwd: workDir,
+        env: { ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor", LANG: "en_US.UTF-8", LC_ALL: "en_US.UTF-8" } as Record<string, string>,
+      });
+      session.ptyProcess = ptyProcess;
+      session.usePty = true;
+
+      ptyProcess.onData((data: string) => {
+        const msg = JSON.stringify({ type: "output", data });
+        session.clients.forEach((c) => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
+      });
+
+      ptyProcess.onExit(({ exitCode }: { exitCode: number }) => {
+        session.status = "exited";
+        const msg = JSON.stringify({ type: "exit" });
+        session.clients.forEach((c) => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
+      });
+
+      logger.info({ id, shell, method: "pty" }, "Terminal created (PTY)");
+    } catch (err) {
+      logger.warn({ err }, "PTY spawn failed, falling back to child_process");
+      ptyAvailable = false;
+    }
+  }
+
+  if (!session.usePty) {
+    try {
+      const child = spawnChild(shell, args.length > 0 ? args : [], {
+        cwd: workDir,
+        env: { ...process.env, TERM: "xterm-256color", LANG: "en_US.UTF-8", LC_ALL: "en_US.UTF-8" },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      session.child = child;
+
+      child.stdout?.on("data", (data: Buffer) => {
+        const msg = JSON.stringify({ type: "output", data: data.toString("utf8") });
+        session.clients.forEach((c) => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
+      });
+
+      child.stderr?.on("data", (data: Buffer) => {
+        const msg = JSON.stringify({ type: "output", data: data.toString("utf8") });
+        session.clients.forEach((c) => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
+      });
+
+      child.on("close", () => {
+        session.status = "exited";
+        const msg = JSON.stringify({ type: "exit" });
+        session.clients.forEach((c) => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
+      });
+
+      child.on("error", (err) => {
+        logger.error({ err }, "Child process error");
+        session.status = "exited";
+        const msg = JSON.stringify({ type: "exit" });
+        session.clients.forEach((c) => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
+      });
+
+      logger.info({ id, shell, method: "child_process" }, "Terminal created (child_process)");
+    } catch (err) {
+      logger.error({ err }, "Failed to create terminal");
+      res.status(500).json({ error: "Failed to create terminal session" });
       return;
     }
-
-    const workDir = cwd || (isWindows ? process.env.USERPROFILE || "C:\\" : process.env.HOME || "/");
-
-    let shell: string;
-    let shellArgs: string[];
-
-    if (isWindows) {
-      shell = "cmd.exe";
-      shellArgs = [];
-    } else {
-      const candidates = [process.env.SHELL, "/bin/bash", "/bin/sh"];
-      shell = candidates.find(s => { try { return s && fs.existsSync(s); } catch { return false; } }) || "/bin/sh";
-      shellArgs = shell.endsWith("bash") ? ["-i"] : [];
-    }
-
-    const useWsl = isWindows && detectWslShell() !== null;
-
-    const ptyProcess = pty.spawn(shell, shellArgs, {
-      name: "xterm-256color",
-      cols: 120,
-      rows: 30,
-      cwd: useWsl ? "/root" : workDir,
-      env: {
-        ...process.env,
-        TERM: "xterm-256color",
-        COLORTERM: "truecolor",
-        FORCE_COLOR: "true",
-        LANG: "en_US.UTF-8",
-        LC_ALL: "en_US.UTF-8",
-      } as Record<string, string>,
-    });
-
-    session.ptyProcess = ptyProcess;
-
-    if (!isWindows) {
-      setTimeout(() => {
-        try {
-          ptyProcess.write("export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 TERM=xterm-256color\n");
-          ptyProcess.write("PS1='\\[\\e[1;32m\\]┌──(\\[\\e[32m\\]runner\\[\\e[0m\\]\\[\\e[1;32m\\]♥\\[\\e[1;32m\\]serverhub\\[\\e[1;32m\\])-\\[\\e[1;34m\\][\\w]\\[\\e[1;32m\\]\\n└──\\[\\e[0m\\$ '\n");
-          ptyProcess.write("stty utf8 2>/dev/null; bind 'set completion-ignore-case on' 2>/dev/null; bind 'set show-all-if-ambiguous on' 2>/dev/null\n");
-          ptyProcess.write("clear\n");
-        } catch {}
-      }, 300);
-    } else {
-      setTimeout(() => {
-        try {
-          ptyProcess.write("cls\r\n");
-          ptyProcess.write("\x1b[1;32m┌──(\x1b[32mrunner\x1b[0m\x1b[1;32m♥\x1b[1;32mserverhub\x1b[1;32m)-[\x1b[1;34m%cd%\x1b[1;32m]\r\n");
-          ptyProcess.write("\x1b[1;32m└──\x1b[0m ");
-        } catch {}
-      }, 300);
-    }
-
-    ptyProcess.onData((data: string) => {
-      const msg = JSON.stringify({ type: "output", data });
-      session.clients.forEach((client) => {
-        if (client.readyState === WebSocket.OPEN) client.send(msg);
-      });
-    });
-
-    ptyProcess.onExit(({ exitCode }: { exitCode: number }) => {
-      session.status = "exited";
-      logger.info({ id, exitCode }, "Terminal session exited");
-      const msg = JSON.stringify({ type: "exit" });
-      session.clients.forEach((client) => {
-        if (client.readyState === WebSocket.OPEN) client.send(msg);
-      });
-    });
-
-    sessions.set(id, session);
-    logger.info({ id, name: session.name, shell, wsl: useWsl }, "Terminal session created");
-
-    res.status(201).json({
-      id, name: session.name, created_at: session.created_at, status: session.status,
-    });
-  } catch (err) {
-    logger.error({ err }, "Failed to create terminal session");
-    res.status(500).json({ error: "Failed to create session" });
   }
+
+  sessions.set(id, session);
+  res.status(201).json({ id, name: session.name, created_at: session.created_at, status: session.status });
 });
 
 terminalRouterAPI.delete("/terminal/sessions/:id", authenticate, async (req: Request, res: Response): Promise<void> => {
@@ -159,9 +145,10 @@ terminalRouterAPI.delete("/terminal/sessions/:id", authenticate, async (req: Req
   const session = sessions.get(rawId);
   if (!session) { res.status(404).json({ success: false, message: "Session not found" }); return; }
   try {
-    if (session.ptyProcess) session.ptyProcess.kill();
-    session.clients.forEach((client) => {
-      if (client.readyState === WebSocket.OPEN) { client.send(JSON.stringify({ type: "exit" })); client.close(); }
+    if (session.usePty && session.ptyProcess) session.ptyProcess.kill();
+    else if (session.child) session.child.kill("SIGTERM");
+    session.clients.forEach((c) => {
+      if (c.readyState === WebSocket.OPEN) { c.send(JSON.stringify({ type: "exit" })); c.close(); }
     });
     sessions.delete(rawId);
     res.json({ success: true, message: "Session killed" });
@@ -175,26 +162,23 @@ export function setupTerminalWebSocket(wss: WebSocketServer): void {
   wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
     const url = req.url || "";
     const match = url.match(/\/api\/terminal\/ws\/([^/?]+)/);
-    if (!match) {
-      ws.close(); return;
-    }
+    if (!match) { ws.close(); return; }
 
     const sessionId = match[1];
     const session = sessions.get(sessionId);
-    if (!session) {
-      ws.close(); return;
-    }
+    if (!session) { ws.close(); return; }
 
     session.clients.add(ws);
-    logger.info({ sessionId }, "WebSocket client connected to terminal");
+    logger.info({ sessionId }, "WS connected to terminal");
 
     ws.on("message", (rawMsg: Buffer) => {
       try {
         const msg = JSON.parse(rawMsg.toString());
-        if (msg.type === "input" && msg.data && session.ptyProcess) {
-          session.ptyProcess.write(msg.data);
-        } else if (msg.type === "resize" && session.ptyProcess) {
-          if (msg.cols && msg.rows) {
+        if (msg.type === "input" && msg.data) {
+          if (session.usePty && session.ptyProcess) session.ptyProcess.write(msg.data);
+          else if (session.child?.stdin?.writable) session.child.stdin.write(msg.data);
+        } else if (msg.type === "resize") {
+          if (session.usePty && session.ptyProcess && msg.cols && msg.rows) {
             try { session.ptyProcess.resize(msg.cols, msg.rows); } catch {}
           }
         } else if (msg.type === "ping") {
@@ -207,7 +191,6 @@ export function setupTerminalWebSocket(wss: WebSocketServer): void {
 
     ws.on("close", () => {
       session.clients.delete(ws);
-      logger.info({ sessionId }, "WebSocket client disconnected");
     });
 
     ws.on("error", (err) => {

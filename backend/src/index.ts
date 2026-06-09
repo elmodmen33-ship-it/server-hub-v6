@@ -18,9 +18,17 @@ if (Number.isNaN(port) || port <= 0) {
 
 const server = http.createServer(app);
 
-const wss = new WebSocketServer({
-  server,
-  verifyClient: (info) => info.req.url?.includes("/api/terminal/ws/") ?? false,
+const wss = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+  const url = req.url || "";
+  if (url.includes("/api/terminal/ws/")) {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+  } else {
+    socket.destroy();
+  }
 });
 
 setupTerminalWebSocket(wss);
