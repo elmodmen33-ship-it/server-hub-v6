@@ -5,7 +5,7 @@ services:
     region: oregon
     plan: free
     healthCheckPath: /api/healthz
-    buildCommand: cd backend && npm install --include=dev && cd ../frontend && npm install --force && npx vite build
+    buildCommand: apt-get update -qq && apt-get install -y -qq python3 make g++ > /dev/null 2>&1; cd backend && npm install --include=dev && cd ../frontend && npm install --force && npx vite build
     startCommand: cd backend && npx tsx src/index.ts
     envVars:
       - key: PORT
